@@ -1,5 +1,5 @@
 export type ConnectionState = "checking" | "online" | "offline";
-export type ListeningState = "ready" | "listening" | "error";
+export type ListeningState = "ready" | "arming" | "listening" | "error";
 export type ProcessingState = "idle" | "processing" | "done" | "error";
 export type TargetState = "unknown" | "selected" | "not_selected";
 
