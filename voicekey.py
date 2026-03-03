@@ -72,6 +72,11 @@ try:
 except ImportError:
     sys.exit("Missing: tkinter (usually bundled with Python)")
 
+try:
+    import winsound
+except ImportError:
+    winsound = None
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -137,6 +142,8 @@ AUDIO_LEVEL_NOISE_FLOOR = 0.004
 AUDIO_LEVEL_ATTACK = 0.40
 AUDIO_LEVEL_RELEASE = 0.18
 AUDIO_LEVEL_CURVE = 0.85
+READY_CHIME_ALIAS = "SystemAsterisk"
+READY_CHIME_COOLDOWN_SECONDS = 0.20
 TAURI_OVERLAY_PROCESS_NAME = "voicekey-overlay.exe"
 TAURI_OVERLAY_BINARY_NAMES = (
     "voicekey-overlay.exe",
@@ -1255,6 +1262,7 @@ class VoiceKeyApp:
         self._heard_audio_in_session = False
         self._no_audio_message_shown = False
         self._listening_armed = False
+        self._last_ready_chime_at = 0.0
         self._tauri_overlay_exe = find_tauri_overlay_exe()
         self._tauri_overlay_process: subprocess.Popen | None = None
         self._tauri_overlay_started_by_app = False
@@ -1424,6 +1432,7 @@ class VoiceKeyApp:
                     self._listening_armed = True
                     self._record_started_at = time.monotonic()
                     self._overlay.update(listening="listening", processing="idle", message="Listening...")
+                    self._play_ready_chime()
                 self._audio_frames.append(chunk)
                 rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
                 raw_level = max(0.0, min(1.0, rms / AUDIO_LEVEL_NORMALIZATION))
@@ -1566,6 +1575,25 @@ class VoiceKeyApp:
     # ------------------------------------------------------------------
     # Notifications
     # ------------------------------------------------------------------
+
+    def _play_ready_chime(self) -> None:
+        """Play a short chime when the microphone stream is ready."""
+        if os.name != "nt" or winsound is None:
+            return
+        now = time.monotonic()
+        if now - self._last_ready_chime_at < READY_CHIME_COOLDOWN_SECONDS:
+            return
+        self._last_ready_chime_at = now
+        try:
+            winsound.PlaySound(
+                READY_CHIME_ALIAS,
+                winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+            )
+        except Exception:
+            try:
+                winsound.MessageBeep()
+            except Exception:
+                pass
 
     def _notify_error(self, message: str) -> None:
         """Show a tray notification."""

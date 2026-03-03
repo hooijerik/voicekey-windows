@@ -9,6 +9,7 @@ Hold a hotkey → speak → release → your words are typed anywhere on screen.
 ## Features
 
 - 🎤 **Push-to-talk** — hold your hotkey, speak, release; text appears instantly
+- 🔔 **Ready ping** — a short chime plays when the microphone is armed, so you know exactly when to start speaking
 - ⌨️ **Types anywhere** — works in any app: browser, Word, Slack, VS Code, etc.
 - 🔔 **System tray** — runs quietly in the background, coloured icon shows state
 - ⚙️ **Configurable** — hotkey, language, paste mode, model, API endpoint
@@ -58,7 +59,7 @@ Sign up at [console.mistral.ai](https://console.mistral.ai) — Voxtral is avail
 
 | Action | How |
 |--------|-----|
-| Start recording | Hold **Right Alt** |
+| Start recording | Hold **Right Alt**, wait for the short ping, then speak |
 | Stop & transcribe | Release the hotkey |
 | Open Settings | Right-click tray icon → **Settings** |
 | Quit | Right-click tray icon → **Quit** |

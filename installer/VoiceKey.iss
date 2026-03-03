@@ -1,5 +1,5 @@
 #define MyAppName "VoiceKey"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "VoiceKey"
 #define MyAppExeName "backend\\VoiceKey.exe"
 
@@ -13,7 +13,7 @@ DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 LicenseFile=..\LICENSE
 OutputDir=..\dist-installer
-OutputBaseFilename=VoiceKey-Setup
+OutputBaseFilename=VoiceKey-Setup-{#MyAppVersion}
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
