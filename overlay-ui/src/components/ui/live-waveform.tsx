@@ -230,16 +230,20 @@ export function LiveWaveform({
       const shouldDrawBars = active || processing || (mode === "scrolling" && historyRef.current.length > 0);
       if (shouldDrawBars) {
         const color = barColor ?? "#ffffff";
-        const centerY = heightPx / 2;
         const values = mode === "scrolling" && historyRef.current.length > 0
           ? ensureLength(historyRef.current, barCount)
           : barsRef.current;
+        const topInset = 6;
+        const bottomInset = 4;
+        const maxBarArea = Math.max(baseBarHeight, heightPx - topInset - bottomInset);
+        const contentWidth = barCount * barWidth + Math.max(0, barCount - 1) * barGap;
+        const xOffset = Math.max(0, (width - contentWidth) / 2);
 
         for (let index = 0; index < barCount; index += 1) {
           const value = values[index] ?? 0.04;
-          const x = index * step;
-          const barH = Math.max(baseBarHeight, value * heightPx * 0.85);
-          const y = centerY - barH / 2;
+          const x = xOffset + index * step;
+          const barH = Math.max(baseBarHeight, value * maxBarArea);
+          const y = heightPx - bottomInset - barH;
 
           ctx.fillStyle = color;
           ctx.globalAlpha = 0.26 + value * 0.74;

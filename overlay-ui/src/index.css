@@ -46,3 +46,15 @@
     -moz-osx-font-smoothing: grayscale;
   }
 }
+
+@keyframes voicekey-bubble-hide {
+  0% {
+    opacity: 1;
+  }
+  72% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}

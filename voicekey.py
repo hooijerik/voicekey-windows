@@ -13,6 +13,7 @@ import math
 import queue
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -71,6 +72,11 @@ try:
 except ImportError:
     sys.exit("Missing: tkinter (usually bundled with Python)")
 
+try:
+    import winsound
+except ImportError:
+    winsound = None
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -121,18 +127,28 @@ ICON_COLORS = {
     "processing": (220, 140, 0, 255),
 }
 
-# Minimum audio size to bother sending (< 0.25 s at 16 kHz / int16)
-MIN_AUDIO_BYTES = 8000
+# Absolute floor to ignore empty/micro-tap captures (WAV bytes incl. header).
+MIN_AUDIO_BYTES = 800
+# If no speech activity was detected, skip very short captures.
+MIN_AUDIO_SECONDS_WITHOUT_ACTIVITY = 0.10
 CONNECTION_CHECK_INTERVAL = 12
 OVERLAY_BRIDGE_ADDR = ("127.0.0.1", 38485)
 NO_AUDIO_MESSAGE_DELAY_SECONDS = 5.0
-AUDIO_ACTIVITY_THRESHOLD = 0.02
+AUDIO_ACTIVITY_THRESHOLD = 0.008
+AUDIO_ACTIVITY_LEVEL_THRESHOLD = 0.02
 AUDIO_LEVEL_PUSH_INTERVAL_SECONDS = 0.02
-AUDIO_LEVEL_NORMALIZATION = 6800.0
-AUDIO_LEVEL_NOISE_FLOOR = 0.012
+AUDIO_LEVEL_NORMALIZATION = 2200.0
+AUDIO_LEVEL_NOISE_FLOOR = 0.004
 AUDIO_LEVEL_ATTACK = 0.40
 AUDIO_LEVEL_RELEASE = 0.18
 AUDIO_LEVEL_CURVE = 0.85
+READY_CHIME_ALIAS = "SystemAsterisk"
+READY_CHIME_COOLDOWN_SECONDS = 0.20
+TAURI_OVERLAY_PROCESS_NAME = "voicekey-overlay.exe"
+TAURI_OVERLAY_BINARY_NAMES = (
+    "voicekey-overlay.exe",
+    "VoiceKey Overlay.exe",
+)
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -146,6 +162,66 @@ def _env_flag(name: str) -> bool:
 
 DEBUG_OVERLAY_STATES = _env_flag("VOICEKEY_DEBUG_OVERLAY")
 DEBUG_OVERLAY_VERBOSE = _env_flag("VOICEKEY_DEBUG_OVERLAY_VERBOSE")
+
+
+def find_tauri_overlay_exe() -> str | None:
+    """Return best candidate Tauri overlay executable path, if present."""
+    explicit = os.environ.get("VOICEKEY_TAURI_OVERLAY_EXE", "").strip()
+    if explicit:
+        resolved = os.path.abspath(explicit)
+        if os.path.isfile(resolved):
+            return resolved
+
+    search_dirs: list[str] = []
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(sys.executable)
+        search_dirs.extend([exe_dir, os.path.dirname(exe_dir)])
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        search_dirs.extend(
+            [
+                script_dir,
+                os.path.join(script_dir, "overlay-ui", "src-tauri", "target", "release"),
+                os.path.join(script_dir, "overlay-ui", "src-tauri", "target", "debug"),
+            ]
+        )
+
+    seen: set[str] = set()
+    for base_dir in search_dirs:
+        for binary_name in TAURI_OVERLAY_BINARY_NAMES:
+            candidate = os.path.abspath(os.path.join(base_dir, binary_name))
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def tauri_overlay_only_enabled() -> bool:
+    """Resolve whether native Tk overlay should be disabled in favor of Tauri."""
+    raw = os.environ.get("VOICEKEY_TAURI_OVERLAY_ONLY")
+    if raw is not None and raw.strip():
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return find_tauri_overlay_exe() is not None
+
+
+def is_tauri_overlay_process_running() -> bool:
+    """Check whether the Tauri overlay process is already running."""
+    if os.name != "nt":
+        return False
+    try:
+        proc = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {TAURI_OVERLAY_PROCESS_NAME}"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        return TAURI_OVERLAY_PROCESS_NAME in proc.stdout.lower()
+    except Exception:
+        return False
 
 
 def overlay_debug(message: str) -> None:
@@ -320,7 +396,7 @@ class StatusOverlay:
     BUBBLE_WIDTH = 89
     BUBBLE_HEIGHT = 40
     BUBBLE_RADIUS = 7
-    LEVEL_ACTIVE_THRESHOLD = 0.10
+    LEVEL_ACTIVE_THRESHOLD = 0.05
 
     def __init__(self):
         self._queue: queue.Queue = queue.Queue()
@@ -328,8 +404,7 @@ class StatusOverlay:
         self._ready = threading.Event()
         self._phase = 0.0
         self._level_filtered = 0.0
-        tauri_only = os.environ.get("VOICEKEY_TAURI_OVERLAY_ONLY", "").strip().lower()
-        self._native_enabled = tauri_only not in {"1", "true", "yes", "on"}
+        self._native_enabled = not tauri_overlay_only_enabled()
         self._bridge_hide_timer: threading.Timer | None = None
         self._bridge_socket: socket.socket | None = None
         try:
@@ -639,6 +714,8 @@ class StatusOverlay:
                 return "error"
             if status.get("target") == "not_selected":
                 return "warning"
+            if status.get("listening") == "arming":
+                return "loading"
             if status.get("processing") == "processing":
                 return "processing"
             if status.get("listening") == "listening":
@@ -658,10 +735,12 @@ class StatusOverlay:
                 return "No connection"
             if mode == "error":
                 return "Try again"
-            if mode == "listening_wait":
-                return "Listening..."
             if message:
                 return message
+            if mode == "loading":
+                return "Starting..."
+            if mode == "listening_wait":
+                return "Listening..."
             return None
 
         def _wave_coords(mode: str, depth: float, phase_offset: float = 0.0) -> list[float]:
@@ -681,6 +760,10 @@ class StatusOverlay:
                     shimmer = 1.0 + 0.06 * math.sin(self._phase * 1.4 + t * 8.0 + phase_offset)
                     amp = ((5.0 + 7.5 * depth) * profile + 1.5) * shimmer
                     y = baseline - amp
+                elif mode == "loading":
+                    arch = math.sin(math.pi * t) ** 0.92
+                    pulse = 1.0 + 0.05 * math.sin(self._phase * 0.8 + phase_offset)
+                    y = baseline - ((6.3 + 1.0 * depth) * arch * pulse)
                 elif mode == "processing":
                     arch = math.sin(math.pi * t) ** 0.92
                     pulse = 1.0 + 0.05 * math.sin(self._phase * 0.6 + phase_offset)
@@ -725,7 +808,7 @@ class StatusOverlay:
                 main = "#ffe4b3"
                 soft = "#f4cf8f"
                 dim = "#dcb874"
-            elif mode == "processing":
+            elif mode in {"processing", "loading"}:
                 main = "#fafafa"
                 soft = "#e6e6e6"
                 dim = "#cbcbcb"
@@ -748,7 +831,7 @@ class StatusOverlay:
             canvas.coords(wave_soft, *_wave_coords(mode, depth * 0.78, 0.45))
             canvas.coords(wave_main, *_wave_coords(mode, depth * 1.00, 0.10))
 
-            if mode == "processing":
+            if mode in {"processing", "loading"}:
                 dash_y = bar_y1 + 17 + 0.25 * math.sin(self._phase * 0.7)
                 dash_x1 = (bar_x1 + bar_x2) / 2 - 7
                 dash_x2 = dash_x1 + 14
@@ -927,6 +1010,14 @@ def record_to_wav(audio_frames: list, sample_rate: int) -> bytes:
         wf.setframerate(sample_rate)
         wf.writeframes(pcm.tobytes())
     return buf.getvalue()
+
+
+def audio_duration_seconds(audio_frames: list, sample_rate: int) -> float:
+    """Return duration of buffered PCM frames in seconds."""
+    if not audio_frames or sample_rate <= 0:
+        return 0.0
+    total_samples = sum(int(frame.shape[0]) for frame in audio_frames)
+    return total_samples / float(sample_rate)
 
 
 # ---------------------------------------------------------------------------
@@ -1170,6 +1261,11 @@ class VoiceKeyApp:
         self._record_started_at = 0.0
         self._heard_audio_in_session = False
         self._no_audio_message_shown = False
+        self._listening_armed = False
+        self._last_ready_chime_at = 0.0
+        self._tauri_overlay_exe = find_tauri_overlay_exe()
+        self._tauri_overlay_process: subprocess.Popen | None = None
+        self._tauri_overlay_started_by_app = False
 
     # ------------------------------------------------------------------
     # State / icon management
@@ -1189,9 +1285,7 @@ class VoiceKeyApp:
         if self._tray:
             self._tray.icon = make_icon(state)
             self._tray.title = tooltip
-        if state == "recording":
-            self._overlay.update(listening="listening", processing="idle", message="Listening...")
-        elif state == "processing":
+        if state == "processing":
             self._overlay.update(listening="ready", processing="processing", message="Processing...")
         else:
             self._overlay.update(listening="ready", message="")
@@ -1334,6 +1428,11 @@ class VoiceKeyApp:
         chunk = indata.copy()
         with self._audio_lock:
             if self._recording:
+                if not self._listening_armed:
+                    self._listening_armed = True
+                    self._record_started_at = time.monotonic()
+                    self._overlay.update(listening="listening", processing="idle", message="Listening...")
+                    self._play_ready_chime()
                 self._audio_frames.append(chunk)
                 rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
                 raw_level = max(0.0, min(1.0, rms / AUDIO_LEVEL_NORMALIZATION))
@@ -1347,7 +1446,12 @@ class VoiceKeyApp:
                 level = previous_level + (target_level - previous_level) * blend
                 self._level_smoothed = max(0.0, min(1.0, level))
 
-                if (not self._heard_audio_in_session) and (raw_level > AUDIO_ACTIVITY_THRESHOLD):
+                heard_audio = (
+                    raw_level > AUDIO_ACTIVITY_THRESHOLD
+                    or self._level_smoothed >= AUDIO_ACTIVITY_LEVEL_THRESHOLD
+                )
+
+                if (not self._heard_audio_in_session) and heard_audio:
                     self._heard_audio_in_session = True
                     if self._no_audio_message_shown:
                         self._overlay.update(message="Listening...")
@@ -1355,6 +1459,7 @@ class VoiceKeyApp:
                 elif (
                     (not self._heard_audio_in_session)
                     and (not self._no_audio_message_shown)
+                    and (self._level_smoothed < AUDIO_ACTIVITY_LEVEL_THRESHOLD)
                     and ((time.monotonic() - self._record_started_at) >= NO_AUDIO_MESSAGE_DELAY_SECONDS)
                 ):
                     self._overlay.update(message="No audio detected")
@@ -1375,21 +1480,23 @@ class VoiceKeyApp:
             self._record_started_at = time.monotonic()
             self._heard_audio_in_session = False
             self._no_audio_message_shown = False
+            self._listening_armed = False
             with self._audio_lock:
                 self._audio_frames = []
+        self._set_state("recording")
+        self._overlay.update(
+            connection=self._connection_state,
+            listening="arming",
+            processing="idle",
+            target=self._target_status(),
+            level=0.0,
+            message="Starting...",
+        )
+        with self._lock:
             if not self._ensure_audio_stream():
                 self._recording = False
                 self._set_state("idle")
                 return
-        self._set_state("recording")
-        self._overlay.update(
-            connection=self._connection_state,
-            listening="listening",
-            processing="idle",
-            target=self._target_status(),
-            level=0.0,
-            message="Listening...",
-        )
 
     def _stop_recording(self) -> None:
         with self._lock:
@@ -1399,26 +1506,36 @@ class VoiceKeyApp:
 
         with self._audio_lock:
             frames = list(self._audio_frames)
+            heard_audio = self._heard_audio_in_session
             self._audio_frames = []
         self._stop_audio_stream()
 
         # Run transcription in a background daemon thread
-        t = threading.Thread(target=self._transcribe_and_type, args=(frames,), daemon=True)
+        t = threading.Thread(
+            target=self._transcribe_and_type,
+            args=(frames, heard_audio),
+            daemon=True,
+        )
         t.start()
 
     # ------------------------------------------------------------------
     # Transcription & typing
     # ------------------------------------------------------------------
 
-    def _transcribe_and_type(self, frames: list) -> None:
+    def _transcribe_and_type(self, frames: list, heard_audio: bool) -> None:
         """Background: convert frames to WAV, transcribe, then type text."""
         self._set_state("processing")
         self._overlay.update(connection=self._connection_state, target=self._target_status(), level=0.0)
         try:
             sr = int(self.cfg.get("sample_rate", 16000))
+            duration = audio_duration_seconds(frames, sr)
             wav_bytes = record_to_wav(frames, sr)
 
             if len(wav_bytes) < MIN_AUDIO_BYTES:
+                self._overlay.update(processing="done")
+                self._set_state("idle")
+                return
+            if (not heard_audio) and (duration < MIN_AUDIO_SECONDS_WITHOUT_ACTIVITY):
                 self._overlay.update(processing="done")
                 self._set_state("idle")
                 return
@@ -1459,6 +1576,25 @@ class VoiceKeyApp:
     # Notifications
     # ------------------------------------------------------------------
 
+    def _play_ready_chime(self) -> None:
+        """Play a short chime when the microphone stream is ready."""
+        if os.name != "nt" or winsound is None:
+            return
+        now = time.monotonic()
+        if now - self._last_ready_chime_at < READY_CHIME_COOLDOWN_SECONDS:
+            return
+        self._last_ready_chime_at = now
+        try:
+            winsound.PlaySound(
+                READY_CHIME_ALIAS,
+                winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
+            )
+        except Exception:
+            try:
+                winsound.MessageBeep()
+            except Exception:
+                pass
+
     def _notify_error(self, message: str) -> None:
         """Show a tray notification."""
         if self._tray:
@@ -1470,6 +1606,39 @@ class VoiceKeyApp:
     # ------------------------------------------------------------------
     # Tray menu callbacks
     # ------------------------------------------------------------------
+
+    def _start_tauri_overlay(self) -> None:
+        if not self._tauri_overlay_exe:
+            return
+        if is_tauri_overlay_process_running():
+            return
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            self._tauri_overlay_process = subprocess.Popen(
+                [self._tauri_overlay_exe],
+                cwd=os.path.dirname(self._tauri_overlay_exe),
+                creationflags=flags,
+            )
+            self._tauri_overlay_started_by_app = True
+        except Exception as exc:
+            overlay_debug(f"overlay launch failed: {exc}")
+
+    def _stop_tauri_overlay(self) -> None:
+        proc = self._tauri_overlay_process
+        if not proc or not self._tauri_overlay_started_by_app:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        finally:
+            self._tauri_overlay_process = None
+            self._tauri_overlay_started_by_app = False
 
     def _open_settings(self, icon=None, item=None) -> None:
         t = threading.Thread(target=self._settings.open, daemon=True)
@@ -1484,6 +1653,7 @@ class VoiceKeyApp:
         self._stop_audio_stream()
         self._connection_stop.set()
         self._overlay.stop()
+        self._stop_tauri_overlay()
         if self._tray:
             self._tray.stop()
         os._exit(0)
@@ -1494,6 +1664,7 @@ class VoiceKeyApp:
 
     def run(self) -> None:
         """Build tray icon and start the application."""
+        self._start_tauri_overlay()
         self._overlay.start()
         self._overlay.update(
             connection="checking",
@@ -1541,6 +1712,4 @@ class VoiceKeyApp:
 if __name__ == "__main__":
     app = VoiceKeyApp()
     app.run()
-
-
 
